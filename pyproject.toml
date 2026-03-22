@@ -1,0 +1,16 @@
+[project]
+name = "merlin-cv-mcp"
+version = "0.1.0"
+description = "Servidor MCP para manipulação local de imagens via OpenCV, integrado ao nanobot."
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Dependências estritas e otimizadas
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "opencv-python-headless>=4.8.0",
+    "numpy>=1.24.0"
+]
+
+[project.scripts]
+merlin-cv = "opencv_mcp_server.main:main"
