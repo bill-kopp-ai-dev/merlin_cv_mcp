@@ -6,18 +6,76 @@ It includes functionality for extracting frames, detecting motion,
 and tracking objects in videos.
 """
 
+from __future__ import annotations
+
 import cv2
 import numpy as np
 import os
 import logging
-import platform
-import subprocess
+import time
 from typing import Optional, List, Dict, Any, Tuple
 
 # Import utility functions from utils
-from .utils import get_timestamp, get_video_output_folder, safe_path
+from .utils import (
+    CAMERA_ENABLE_ENV,
+    get_max_camera_duration_seconds,
+    get_max_image_dimension,
+    get_max_video_fps,
+    get_max_video_frames,
+    get_models_dir,
+    resolve_model_asset_path,
+    sanitize_class_label,
+    get_timestamp,
+    get_video_output_folder,
+    open_video_with_system_viewer,
+    safe_path,
+    should_enable_camera_access,
+    should_show_camera_preview,
+    validate_float_param,
+    validate_int_param,
+)
+from .security import record_security_event
 
 logger = logging.getLogger("opencv-mcp-server.video_processing")
+
+_YOLO_MODEL_CACHE: Dict[Tuple[str, str], Tuple[cv2.dnn_Net, List[str]]] = {}
+_CLASS_NAME_CACHE: Dict[str, List[str]] = {}
+
+
+def _resolve_yolo_output_layers(net: cv2.dnn_Net) -> List[str]:
+    layer_names = net.getLayerNames()
+    try:
+        # OpenCV newer versions
+        return [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+    except Exception:
+        # OpenCV older versions
+        return [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+
+
+def _load_class_names(classes_path: str) -> List[str]:
+    cached = _CLASS_NAME_CACHE.get(classes_path)
+    if cached is not None:
+        return cached
+
+    with open(classes_path, "r", encoding="utf-8") as f:
+        classes = [
+            sanitize_class_label(line.strip(), fallback=f"class_{index}")
+            for index, line in enumerate(f.readlines())
+        ]
+    _CLASS_NAME_CACHE[classes_path] = classes
+    return classes
+
+
+def _load_yolo_net(model_path: str, config_path: str) -> Tuple[cv2.dnn_Net, List[str]]:
+    cache_key = (model_path, config_path)
+    cached = _YOLO_MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    net = cv2.dnn.readNetFromDarknet(config_path, model_path)
+    output_layers = _resolve_yolo_output_layers(net)
+    _YOLO_MODEL_CACHE[cache_key] = (net, output_layers)
+    return net, output_layers
 
 # Video utility functions
 def get_video_info(video_path: str) -> Dict[str, Any]:
@@ -96,30 +154,6 @@ def detect_video_file(file_path: str) -> bool:
         logger.error(f"Error detecting video file: {str(e)}")
         return False
 
-def open_video_with_system_viewer(video_path: str) -> None:
-    """
-    Open a video with the system's default video player
-    
-    Args:
-        video_path: Path to the video file
-    """
-    video_path = str(safe_path(video_path))
-    # Platform-specific video opening commands
-    system = platform.system()
-    
-    try:
-        if system == 'Windows':
-            os.startfile(video_path)
-        elif system == 'Darwin':  # macOS
-            subprocess.call(['open', video_path])
-        else:  # Linux and other Unix-like systems
-            subprocess.call(['xdg-open', video_path])
-        
-        logger.info(f"Opened video: {video_path}")
-    except Exception as e:
-        logger.error(f"Error opening video with system viewer: {e}")
-        # Continue execution even if display fails
-
 # Tool implementations
 def extract_video_frames_tool(
     video_path: str,
@@ -157,16 +191,26 @@ def extract_video_frames_tool(
         # Get video info
         video_info = get_video_info(video_path)
         total_frames = video_info["frame_count"]
-        
+        max_video_frames = get_max_video_frames()
+
         # Validate and adjust parameters
-        if start_frame < 0:
-            start_frame = 0
-        
-        if end_frame is None or end_frame >= total_frames:
+        start_frame = validate_int_param("start_frame", start_frame, minimum=0)
+        step = validate_int_param("step", step, minimum=1, maximum=1000)
+        max_frames = validate_int_param(
+            "max_frames",
+            max_frames,
+            minimum=1,
+            maximum=max_video_frames,
+        )
+
+        if end_frame is None:
             end_frame = total_frames - 1
-        
-        if step < 1:
-            step = 1
+        else:
+            end_frame = validate_int_param("end_frame", end_frame, minimum=0)
+            end_frame = min(end_frame, total_frames - 1)
+
+        if end_frame < start_frame:
+            raise ValueError("Parameter 'end_frame' must be >= 'start_frame'.")
         
         # Set output directory
         if output_dir is None:
@@ -236,6 +280,9 @@ def extract_video_frames_tool(
                 "end_frame": end_frame,
                 "step": step,
                 "max_frames": max_frames
+            },
+            "security_limits": {
+                "max_video_frames": max_video_frames
             },
             "video_info": video_info,
             "output_dir": output_dir
@@ -405,13 +452,18 @@ def track_object_tool(
         # Get video info
         video_info = get_video_info(video_path)
         total_frames = video_info["frame_count"]
-        
+        max_video_frames = get_max_video_frames()
+
         # Validate parameters
-        if start_frame < 0:
-            start_frame = 0
-        
-        if frame_step < 1:
-            frame_step = 1
+        start_frame = validate_int_param("start_frame", start_frame, minimum=0)
+        frame_step = validate_int_param("frame_step", frame_step, minimum=1, maximum=1000)
+        max_frames = validate_int_param(
+            "max_frames",
+            max_frames,
+            minimum=1,
+            maximum=max_video_frames,
+        )
+        max_extract = validate_int_param("max_extract", max_extract, minimum=0, maximum=max_frames)
         
         # Set output directory
         if output_dir is None:
@@ -457,6 +509,9 @@ def track_object_tool(
         # Validate initial bbox
         if len(initial_bbox) != 4:
             raise ValueError("initial_bbox must contain exactly 4 values: [x, y, width, height]")
+        initial_bbox = [int(v) for v in initial_bbox]
+        if initial_bbox[2] <= 0 or initial_bbox[3] <= 0:
+            raise ValueError("initial_bbox width and height must be > 0.")
         
         # Initialize tracker data
         tracking_data = []
@@ -470,6 +525,14 @@ def track_object_tool(
         
         if not ret:
             raise ValueError(f"Failed to read frame at index {start_frame}")
+
+        frame_h, frame_w = frame.shape[:2]
+        x0, y0, w0, h0 = initial_bbox
+        if x0 < 0 or y0 < 0 or (x0 + w0) > frame_w or (y0 + h0) > frame_h:
+            raise ValueError(
+                "initial_bbox is outside frame bounds "
+                f"({frame_w}x{frame_h})."
+            )
         
         # Initialize tracker
         tracker = tracker_create()
@@ -582,6 +645,9 @@ def track_object_tool(
                 "max_frames": max_frames,
                 "frame_step": frame_step
             },
+            "security_limits": {
+                "max_video_frames": max_video_frames
+            },
             "video_info": video_info,
             "output_dir": output_dir
         }
@@ -610,10 +676,21 @@ def combine_frames_to_video_tool(
     - 'output_path': Arquivo final de vídeo no workspace.
     """
     try:
+        max_video_frames = get_max_video_frames()
+        max_image_dimension = get_max_image_dimension()
+        max_video_fps = get_max_video_fps()
+
         frame_paths = [str(safe_path(p)) for p in frame_paths]
         output_path = str(safe_path(output_path))
         if not frame_paths:
             raise ValueError("No frames provided")
+        if len(frame_paths) > max_video_frames:
+            raise ValueError(
+                f"Too many input frames ({len(frame_paths)}). "
+                f"Maximum allowed: {max_video_frames}."
+            )
+
+        fps = validate_float_param("fps", fps, minimum=0.1, maximum=max_video_fps)
         
         # Get dimensions from first frame if not specified
         first_frame = cv2.imread(frame_paths[0])
@@ -624,6 +701,21 @@ def combine_frames_to_video_tool(
             h, w = first_frame.shape[:2]
             width = width or w
             height = height or h
+
+        width = validate_int_param(
+            "width",
+            width,
+            minimum=16,
+            maximum=max_image_dimension,
+        )
+        height = validate_int_param(
+            "height",
+            height,
+            minimum=16,
+            maximum=max_image_dimension,
+        )
+        if len(fourcc) != 4:
+            raise ValueError("Parameter 'fourcc' must contain exactly 4 characters.")
         
         # Create output directory if it doesn't exist
         output_dir = os.path.dirname(output_path)
@@ -665,6 +757,11 @@ def combine_frames_to_video_tool(
                 "fps": fps,
                 "fourcc": fourcc
             },
+            "security_limits": {
+                "max_video_frames": max_video_frames,
+                "max_image_dimension": max_image_dimension,
+                "max_video_fps": max_video_fps,
+            },
             "size_bytes": os.path.getsize(output_path) if os.path.exists(output_path) else None
         }
         
@@ -689,8 +786,22 @@ def create_mp4_from_video_tool(
     
     REGRAS DE ARQUIVO:
     - 'video_path': O vídeo que será convertido.
+
+    LIMITES E SEGURANÇA:
+    - `width`/`height` respeitam `MERLIN_CV_MAX_IMAGE_DIMENSION`.
+    - `fps` respeita `MERLIN_CV_MAX_VIDEO_FPS`.
+    - Processamento total é limitado por `MERLIN_CV_MAX_VIDEO_FRAMES`.
+    - Se o limite de frames for atingido, `security_limits.truncated_by_limit` vem como `true`.
+
+    RETORNO RELEVANTE PARA ORQUESTRAÇÃO:
+    - `video_parameters`: resolução/fps realmente aplicados.
+    - `security_limits`: transparência sobre limites ativos durante a execução.
     """
     try:
+        max_video_frames = get_max_video_frames()
+        max_image_dimension = get_max_image_dimension()
+        max_video_fps = get_max_video_fps()
+
         video_path = str(safe_path(video_path))
         if output_path is not None:
             output_path = str(safe_path(output_path))
@@ -716,6 +827,24 @@ def create_mp4_from_video_tool(
         target_width = width or video_info["width"]
         target_height = height or video_info["height"]
         target_fps = fps or video_info["fps"]
+        target_width = validate_int_param(
+            "width",
+            target_width,
+            minimum=16,
+            maximum=max_image_dimension,
+        )
+        target_height = validate_int_param(
+            "height",
+            target_height,
+            minimum=16,
+            maximum=max_image_dimension,
+        )
+        target_fps = validate_float_param(
+            "fps",
+            target_fps,
+            minimum=0.1,
+            maximum=max_video_fps,
+        )
         
         # Set quality parameters
         quality_settings = {
@@ -755,7 +884,16 @@ def create_mp4_from_video_tool(
             
         # Process frames
         frame_count = 0
+        truncated_by_limit = False
         while True:
+            if frame_count >= max_video_frames:
+                truncated_by_limit = True
+                record_security_event(
+                    "video_processing_truncated",
+                    tool="create_mp4_from_video_tool",
+                    max_video_frames=max_video_frames,
+                )
+                break
             ret, frame = cap.read()
             if not ret:
                 break
@@ -789,6 +927,12 @@ def create_mp4_from_video_tool(
                 "height": target_height,
                 "fps": target_fps,
                 "quality": quality
+            },
+            "security_limits": {
+                "max_video_frames": max_video_frames,
+                "max_image_dimension": max_image_dimension,
+                "max_video_fps": max_video_fps,
+                "truncated_by_limit": truncated_by_limit,
             },
             "size_bytes": os.path.getsize(output_path),
             "size_mb": round(os.path.getsize(output_path) / (1024 * 1024), 2)
@@ -825,11 +969,55 @@ def detect_video_objects_tool(
     
     REGRAS DE ARQUIVO:
     - 'video_path': Vídeo original. Um vídeo de saída MP4 será criado.
+
+    LIMITES E SEGURANÇA:
+    - `frame_step` deve ser >= 1; `start_frame` e `end_frame` são validados.
+    - `confidence_threshold` e `nms_threshold` em [0.0, 1.0].
+    - `width`/`height` de inferência respeitam `MERLIN_CV_MAX_IMAGE_DIMENSION`.
+    - `fps` de saída respeita `MERLIN_CV_MAX_VIDEO_FPS`.
+    - O número total de frames processados é limitado por `MERLIN_CV_MAX_VIDEO_FRAMES`.
+    - Arquivos de modelo (`model_path`, `config_path`, `classes_path`) ficam restritos a `OPENCV_DNN_MODELS_DIR`.
+    - Labels retornados são sanitizados para reduzir risco de prompt injection em cadeias multiagente.
+
+    RETORNO RELEVANTE PARA AGENTE:
+    - `detection_counts`: agregado por classe para respostas rápidas de contagem.
+    - `security_limits`: indica se houve truncamento por política (`truncated_by_limit`).
+    - `output_path`: vídeo anotado pronto para consumo pelo usuário/etapa seguinte.
     """
     try:
+        max_video_frames = get_max_video_frames()
+        max_image_dimension = get_max_image_dimension()
+        max_video_fps = get_max_video_fps()
+
         video_path = str(safe_path(video_path))
         if output_path is not None:
             output_path = str(safe_path(output_path))
+        confidence_threshold = validate_float_param(
+            "confidence_threshold",
+            confidence_threshold,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        nms_threshold = validate_float_param(
+            "nms_threshold",
+            nms_threshold,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        width = validate_int_param(
+            "width",
+            width,
+            minimum=32,
+            maximum=max_image_dimension,
+        )
+        height = validate_int_param(
+            "height",
+            height,
+            minimum=32,
+            maximum=max_image_dimension,
+        )
+        frame_step = validate_int_param("frame_step", frame_step, minimum=1, maximum=1000)
+        thickness = validate_int_param("thickness", thickness, minimum=1, maximum=20)
         
         # Validate video file
         if not os.path.exists(video_path):
@@ -846,14 +1034,16 @@ def detect_video_objects_tool(
         total_frames = video_info["frame_count"]
         
         # Validate and adjust parameters
-        if start_frame < 0:
-            start_frame = 0
+        start_frame = validate_int_param("start_frame", start_frame, minimum=0)
         
-        if end_frame is None or end_frame >= total_frames:
+        if end_frame is None:
             end_frame = total_frames - 1
-        
-        if frame_step < 1:
-            frame_step = 1
+        else:
+            end_frame = validate_int_param("end_frame", end_frame, minimum=0)
+            end_frame = min(end_frame, total_frames - 1)
+
+        if end_frame < start_frame:
+            raise ValueError("Parameter 'end_frame' must be >= 'start_frame'.")
         
         # Generate output path if not provided
         if output_path is None:
@@ -868,19 +1058,10 @@ def detect_video_objects_tool(
             os.makedirs(output_dir)
         
         # Set default model directory
-        model_dir = os.environ.get("OPENCV_DNN_MODELS_DIR", "models")
-        if not os.path.exists(model_dir):
-            os.makedirs(model_dir, exist_ok=True)
-        
-        # Use default YOLO model if paths not provided
-        if model_path is None:
-            model_path = os.path.join(model_dir, "yolov3.weights")
-        
-        if config_path is None:
-            config_path = os.path.join(model_dir, "yolov3.cfg")
-            
-        if classes_path is None:
-            classes_path = os.path.join(model_dir, "coco.names")
+        model_dir = str(get_models_dir())
+        model_path = resolve_model_asset_path(model_path, "yolov3.weights")
+        config_path = resolve_model_asset_path(config_path, "yolov3.cfg")
+        classes_path = resolve_model_asset_path(classes_path, "coco.names")
         
         # Check if model files exist
         model_files_exist = os.path.exists(model_path) and os.path.exists(config_path)
@@ -909,8 +1090,7 @@ def detect_video_objects_tool(
         
         # Load class names
         try:
-            with open(classes_path, 'r') as f:
-                classes = [line.strip() for line in f.readlines()]
+            classes = _load_class_names(classes_path)
         except Exception as e:
             logger.error(f"Error loading class names: {str(e)}")
             # Provide a small subset of COCO classes as fallback
@@ -918,7 +1098,7 @@ def detect_video_objects_tool(
         
         # Try to load the model
         try:
-            net = cv2.dnn.readNetFromDarknet(config_path, model_path)
+            net, output_layers = _load_yolo_net(model_path, config_path)
         except Exception as e:
             logger.error(f"Error loading DNN model: {str(e)}")
             return {
@@ -929,19 +1109,13 @@ def detect_video_objects_tool(
                 }
             }
         
-        # Get output layer names
-        layer_names = net.getLayerNames()
-        
-        # OpenCV 4.5.4+ has a different indexing system
-        try:
-            # For newer OpenCV versions
-            output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
-        except Exception:
-            # For older OpenCV versions
-            output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
-        
         # Initialize video writer
-        target_fps = fps or video_info["fps"]
+        target_fps = validate_float_param(
+            "fps",
+            fps if fps is not None else video_info["fps"],
+            minimum=0.1,
+            maximum=max_video_fps,
+        )
         target_width = int(video_info["width"])
         target_height = int(video_info["height"])
         
@@ -960,6 +1134,8 @@ def detect_video_objects_tool(
         frame_count = 0
         processed_count = 0
         detection_counts = {}
+        requested_frames = ((end_frame - start_frame) // frame_step) + 1
+        truncated_by_limit = False
         
         # Set position to start_frame
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -967,6 +1143,14 @@ def detect_video_objects_tool(
         
         # Process frames
         while current_frame <= end_frame:
+            if processed_count >= max_video_frames:
+                truncated_by_limit = True
+                record_security_event(
+                    "video_processing_truncated",
+                    tool="detect_video_objects_tool",
+                    max_video_frames=max_video_frames,
+                )
+                break
             # Read frame
             ret, frame = cap.read()
             
@@ -1103,6 +1287,13 @@ def detect_video_objects_tool(
                 "height": target_height,
                 "fps": target_fps
             },
+            "security_limits": {
+                "max_video_frames": max_video_frames,
+                "max_image_dimension": max_image_dimension,
+                "max_video_fps": max_video_fps,
+                "requested_frames": requested_frames,
+                "truncated_by_limit": truncated_by_limit,
+            },
             "size_bytes": os.path.getsize(output_path) if os.path.exists(output_path) else None,
             "size_mb": round(os.path.getsize(output_path) / (1024 * 1024), 2) if os.path.exists(output_path) else None
         }
@@ -1136,16 +1327,77 @@ def detect_camera_objects_tool(
     
     REGRAS DE ARQUIVO:
     - O vídeo será salvo automaticamente caso 'output_path' não seja definido.
+
+    POLÍTICA DE SEGURANÇA (IMPORTANTE):
+    - Tool desabilitada por padrão; requer `MERLIN_CV_ENABLE_CAMERA=true`.
+    - `duration` respeita `MERLIN_CV_MAX_CAMERA_DURATION_SECONDS`.
+    - `fps` respeita `MERLIN_CV_MAX_VIDEO_FPS`.
+    - Total de frames é limitado por `MERLIN_CV_MAX_VIDEO_FRAMES`.
+    - Ao bloqueio por política, um evento de segurança é registrado (`camera_access_blocked`).
+
+    RETORNO RELEVANTE PARA AGENTE:
+    - `frames_captured` e `detection_counts` para sumário objetivo.
+    - `security_limits` para explicar cortes por política (ex: truncamento).
+    - `output_path` para encadear com ferramentas de análise/reprodução.
     """
     try:
+        max_video_frames = get_max_video_frames()
+        max_camera_duration = get_max_camera_duration_seconds()
+        max_image_dimension = get_max_image_dimension()
+        max_video_fps = get_max_video_fps()
+
+        if not should_enable_camera_access():
+            record_security_event(
+                "camera_access_blocked",
+                reason="disabled_by_policy",
+            )
+            raise PermissionError(
+                "Camera tools are disabled by default. "
+                f"Set {CAMERA_ENABLE_ENV}=true to enable detect_camera_objects_tool."
+            )
+
+        camera_id = validate_int_param("camera_id", camera_id, minimum=0, maximum=32)
+        duration = validate_int_param(
+            "duration",
+            duration,
+            minimum=1,
+            maximum=max_camera_duration,
+        )
+        confidence_threshold = validate_float_param(
+            "confidence_threshold",
+            confidence_threshold,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        nms_threshold = validate_float_param(
+            "nms_threshold",
+            nms_threshold,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        width = validate_int_param(
+            "width",
+            width,
+            minimum=32,
+            maximum=max_image_dimension,
+        )
+        height = validate_int_param(
+            "height",
+            height,
+            minimum=32,
+            maximum=max_image_dimension,
+        )
+        fps = int(
+            validate_float_param("fps", fps, minimum=1.0, maximum=max_video_fps)
+        )
+        thickness = validate_int_param("thickness", thickness, minimum=1, maximum=20)
+
         if output_path is not None:
             output_path = str(safe_path(output_path))
-        import time
-        
         # Generate output path if not provided
         if output_path is None:
             timestamp = get_timestamp()
-            output_path = os.path.join(os.getcwd(), f"camera_detected_{timestamp}.mp4")
+            output_path = str(safe_path(f"camera_detected_{timestamp}.mp4"))
         
         # Create output directory if it doesn't exist
         output_dir = os.path.dirname(output_path)
@@ -1168,19 +1420,10 @@ def detect_camera_objects_tool(
         camera_height, camera_width = frame.shape[:2]
         
         # Set default model directory
-        model_dir = os.environ.get("OPENCV_DNN_MODELS_DIR", "models")
-        if not os.path.exists(model_dir):
-            os.makedirs(model_dir, exist_ok=True)
-        
-        # Use default YOLO model if paths not provided
-        if model_path is None:
-            model_path = os.path.join(model_dir, "yolov3.weights")
-        
-        if config_path is None:
-            config_path = os.path.join(model_dir, "yolov3.cfg")
-            
-        if classes_path is None:
-            classes_path = os.path.join(model_dir, "coco.names")
+        model_dir = str(get_models_dir())
+        model_path = resolve_model_asset_path(model_path, "yolov3.weights")
+        config_path = resolve_model_asset_path(config_path, "yolov3.cfg")
+        classes_path = resolve_model_asset_path(classes_path, "coco.names")
         
         # Check if model files exist
         model_files_exist = os.path.exists(model_path) and os.path.exists(config_path)
@@ -1209,8 +1452,7 @@ def detect_camera_objects_tool(
         
         # Load class names
         try:
-            with open(classes_path, 'r') as f:
-                classes = [line.strip() for line in f.readlines()]
+            classes = _load_class_names(classes_path)
         except Exception as e:
             logger.error(f"Error loading class names: {str(e)}")
             # Provide a small subset of COCO classes as fallback
@@ -1218,7 +1460,7 @@ def detect_camera_objects_tool(
         
         # Try to load the model
         try:
-            net = cv2.dnn.readNetFromDarknet(config_path, model_path)
+            net, output_layers = _load_yolo_net(model_path, config_path)
         except Exception as e:
             logger.error(f"Error loading DNN model: {str(e)}")
             return {
@@ -1228,17 +1470,6 @@ def detect_camera_objects_tool(
                     "config_path": config_path
                 }
             }
-        
-        # Get output layer names
-        layer_names = net.getLayerNames()
-        
-        # OpenCV 4.5.4+ has a different indexing system
-        try:
-            # For newer OpenCV versions
-            output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
-        except Exception:
-            # For older OpenCV versions
-            output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
         
         # Initialize video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # MP4 codec
@@ -1256,9 +1487,20 @@ def detect_camera_objects_tool(
         frame_count = 0
         detection_counts = {}
         start_time = time.time()
+        truncated_by_limit = False
         
+        preview_enabled = should_show_camera_preview()
+
         # Process frames for the specified duration
         while time.time() - start_time < duration:
+            if frame_count >= max_video_frames:
+                truncated_by_limit = True
+                record_security_event(
+                    "video_processing_truncated",
+                    tool="detect_camera_objects_tool",
+                    max_video_frames=max_video_frames,
+                )
+                break
             # Read frame
             ret, frame = cap.read()
             
@@ -1365,15 +1607,17 @@ def detect_camera_objects_tool(
             # Update counters
             frame_count += 1
             
-            # Display the frame (optional)
-            cv2.imshow("Camera Detection", frame_vis)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            # Display preview only when explicitly enabled.
+            if preview_enabled:
+                cv2.imshow("Camera Detection", frame_vis)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
         
         # Release resources
         cap.release()
         out.release()
-        cv2.destroyAllWindows()
+        if preview_enabled:
+            cv2.destroyAllWindows()
         
         # Open the output video with system's default player
         open_video_with_system_viewer(output_path)
@@ -1401,6 +1645,13 @@ def detect_camera_objects_tool(
                 "fps": fps,
                 "duration": duration
             },
+            "security_limits": {
+                "max_video_frames": max_video_frames,
+                "max_camera_duration_seconds": max_camera_duration,
+                "max_image_dimension": max_image_dimension,
+                "max_video_fps": max_video_fps,
+                "truncated_by_limit": truncated_by_limit,
+            },
             "size_bytes": os.path.getsize(output_path) if os.path.exists(output_path) else None,
             "size_mb": round(os.path.getsize(output_path) / (1024 * 1024), 2) if os.path.exists(output_path) else None
         }
@@ -1423,4 +1674,10 @@ def register_tools(mcp):
     mcp.add_tool(combine_frames_to_video_tool)
     mcp.add_tool(create_mp4_from_video_tool)
     mcp.add_tool(detect_video_objects_tool)
-    mcp.add_tool(detect_camera_objects_tool)
+    if should_enable_camera_access():
+        mcp.add_tool(detect_camera_objects_tool)
+    else:
+        logger.info(
+            "Camera tool registration skipped. Set %s=true to enable.",
+            CAMERA_ENABLE_ENV,
+        )

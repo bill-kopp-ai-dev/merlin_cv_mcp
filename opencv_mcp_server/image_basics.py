@@ -14,7 +14,14 @@ import subprocess
 import platform
 from typing import Optional, Dict, Any, List, Union
 # Import utility functions from utils
-from .utils import get_image_info, save_and_display, get_timestamp, safe_path
+from .utils import (
+    get_image_info,
+    get_max_image_dimension,
+    save_and_display,
+    get_timestamp,
+    safe_path,
+    validate_int_param,
+)
 
 logger = logging.getLogger("opencv-mcp-server.image_basics")
 
@@ -170,8 +177,19 @@ def resize_image_tool(image_path: str, width: int, height: int, interpolation: s
     - 'image_path': O nome ou caminho relativo da imagem de origem no workspace.
     - 'width' e 'height': As novas dimensões. A imagem será salva automaticamente.
     - 'interpolation': Método de interpolação (padrão MANTIDO se não especificado).
+
+    LIMITES E SEGURANÇA:
+    - `width` e `height` são validados como inteiros positivos.
+    - O limite superior é controlado por `MERLIN_CV_MAX_IMAGE_DIMENSION` para evitar uso excessivo.
+
+    RETORNO RELEVANTE PARA ORQUESTRAÇÃO:
+    - `output_path`: caminho final para encadear com outras tools.
+    - `info` e `original_info`: úteis para decidir se nova redução ainda é necessária.
     """
     image_path = str(safe_path(image_path))
+    max_dimension = get_max_image_dimension()
+    width = validate_int_param("width", width, minimum=1, maximum=max_dimension)
+    height = validate_int_param("height", height, minimum=1, maximum=max_dimension)
     # Read image from path
     img = cv2.imread(image_path)
     if img is None:
@@ -219,6 +237,10 @@ def crop_image_tool(image_path: str, x: int, y: int, width: int, height: int) ->
     - O recorte será salvo automaticamente com um sufixo no workspace.
     """
     image_path = str(safe_path(image_path))
+    x = validate_int_param("x", x, minimum=0)
+    y = validate_int_param("y", y, minimum=0)
+    width = validate_int_param("width", width, minimum=1)
+    height = validate_int_param("height", height, minimum=1)
     # Read image from path
     img = cv2.imread(image_path)
     if img is None:

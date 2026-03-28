@@ -81,6 +81,15 @@ Traditional Python OpenCV setups often hit GUI dependency issues in servers and 
 | `combine_frames_to_video_tool` | Combine a sequence of image frames into a video file |
 | `create_mp4_from_video_tool` | Re-encode a video to MP4 format |
 | `detect_video_objects_tool` | Run YOLO object detection across video frames |
+| `detect_camera_objects_tool` | Run YOLO object detection on live camera feed and save recording (registered only when `MERLIN_CV_ENABLE_CAMERA=true`) |
+
+---
+
+### 🛡️ Security (`security`)
+
+| Tool | Description |
+|---|---|
+| `get_security_metrics` | Return in-memory security counters (policy blocks, invalid params, auth failures, etc.) since process start |
 
 ---
 
@@ -99,21 +108,33 @@ cd merlin_cv_mcp
 uv sync
 ```
 
+When running inside `percival.OS_Dev` with nanobot, prefer the shared environment at `percival.OS_Dev/.venv` and avoid creating a local `.venv` inside `mcp_servers/merlin_cv_mcp`.
+
 ---
 
 ## ▶️ Running
 
 ```bash
-uv run opencv_mcp_server/main.py
+uv run -m opencv_mcp_server --mode stdio
 ```
 
 Or via the installed script entry point:
 
 ```bash
-merlin-cv
+merlin-cv --mode stdio
 ```
 
-> **Important:** Make sure to set the `NANOBOT_WORKSPACE` environment variable pointing to your shared image directory.
+HTTP modes are also available:
+
+```bash
+uv run -m opencv_mcp_server --mode sse --host 127.0.0.1 --port 8080
+uv run -m opencv_mcp_server --mode streamable-http --host 127.0.0.1 --port 8080
+```
+
+For non-loopback HTTP bind, use:
+
+- `--allow-remote-http`
+- `MCP_MERLIN_AUTH_TOKEN` (or custom env via `--auth-token-env`)
 
 ---
 
@@ -122,7 +143,19 @@ merlin-cv
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `NANOBOT_WORKSPACE` | ✅ | — | Absolute path to the shared workspace directory. All file operations are sandboxed to this path. |
-| `OPENCV_DNN_MODELS_DIR` | ❌ | — | Path to directory containing YOLO model files (`.cfg`, `.weights`, `.names`) for `detect_objects_tool` and `detect_video_objects_tool` |
+| `OPENCV_DNN_MODELS_DIR` | ❌ | `./models` (project default) | Path to directory containing YOLO model files (`.cfg`, `.weights`, `.names`) for object detection tools. Custom model/config/classes paths are restricted to this directory. |
+| `MERLIN_CV_AUTO_OPEN` | ❌ | `false` | When `true`, auto-opens generated images/videos in system viewer (disabled by default for headless/agent usage) |
+| `MERLIN_CV_ENABLE_CAMERA` | ❌ | `false` | When `true`, enables camera capture tool registration (`detect_camera_objects_tool`) |
+| `MERLIN_CV_CAMERA_PREVIEW` | ❌ | `false` | When `true`, enables OpenCV GUI preview window in `detect_camera_objects_tool` |
+| `MERLIN_CV_MAX_IMAGE_DIMENSION` | ❌ | `4096` | Maximum allowed image dimension (width/height) accepted by resize and DNN input params |
+| `MERLIN_CV_MAX_VIDEO_FRAMES` | ❌ | `1200` | Maximum frames processed per video/camera operation to avoid resource exhaustion |
+| `MERLIN_CV_MAX_CAMERA_DURATION_SECONDS` | ❌ | `60` | Maximum allowed `duration` for camera capture tool |
+| `MERLIN_CV_MAX_VIDEO_FPS` | ❌ | `60` | Maximum accepted FPS in video writer operations |
+| `MCP_MERLIN_AUTH_TOKEN` | ❌ | — | Shared token required when exposing HTTP transport on non-loopback hosts |
+
+---
+
+Security telemetry can be queried at runtime with `get_security_metrics`.
 
 ---
 
@@ -132,12 +165,18 @@ Add the following entry to your agent's `config.json`:
 
 ```json
 "merlin-cv": {
-  "command": "/path/to/.venv/bin/python",
-  "args": ["-m", "opencv_mcp_server.main"],
+  "command": "/path/to/percival.OS_Dev/.venv/bin/python",
+  "args": ["-m", "opencv_mcp_server", "--mode", "stdio"],
   "env": {
-    "PYTHONPATH": "/path/to/merlin_cv_mcp",
     "NANOBOT_WORKSPACE": "/path/to/shared/image/workspace",
-    "OPENCV_DNN_MODELS_DIR": "/path/to/merlin_cv_mcp/models"
+    "OPENCV_DNN_MODELS_DIR": "/path/to/merlin_cv_mcp/models",
+    "MERLIN_CV_AUTO_OPEN": "false",
+    "MERLIN_CV_ENABLE_CAMERA": "false",
+    "MERLIN_CV_CAMERA_PREVIEW": "false",
+    "MERLIN_CV_MAX_IMAGE_DIMENSION": "4096",
+    "MERLIN_CV_MAX_VIDEO_FRAMES": "1200",
+    "MERLIN_CV_MAX_CAMERA_DURATION_SECONDS": "60",
+    "MERLIN_CV_MAX_VIDEO_FPS": "60"
   }
 }
 ```
@@ -166,9 +205,17 @@ Agent: [calls jarvina → generate_image to create the product photo]
 
 ```
 merlin_cv_mcp/
+├── models/                               # Default YOLO assets directory
+├── OPENCV_DNN_MODELS_DIR/                # Optional/legacy model assets directory
 ├── pyproject.toml                        # Dependencies & script entry point
+├── uv.lock                               # Locked dependency graph
+├── tests/
+│   └── test_p2_security_regression.py    # Security regression tests
+├── workspace/                            # Default local workspace fallback
 └── opencv_mcp_server/
+    ├── __main__.py                       # Enables `python -m opencv_mcp_server`
     ├── main.py                           # Entry point — registers all tool modules
+    ├── security.py                       # Security telemetry and protection helpers
     ├── utils.py                          # safe_path() sandbox, image/video helpers
     ├── image_basics.py                   # resize, crop, color conversion, stats
     ├── image_processing.py               # filters, edges, threshold, contours, shapes, template

@@ -6,6 +6,8 @@ It includes functionality for feature detection and matching, face detection,
 and object detection using pre-trained models.
 """
 
+from __future__ import annotations
+
 import cv2
 import numpy as np
 import os
@@ -13,9 +15,58 @@ import logging
 from typing import Optional, List, Dict, Any, Tuple, Union
 
 # Import utility functions from utils
-from .utils import get_image_info, save_and_display, get_timestamp, safe_path
+from .utils import (
+    get_max_image_dimension,
+    get_image_info,
+    get_models_dir,
+    resolve_model_asset_path,
+    sanitize_class_label,
+    save_and_display,
+    safe_path,
+    validate_float_param,
+    validate_int_param,
+)
 
 logger = logging.getLogger("opencv-mcp-server.computer_vision")
+
+_YOLO_MODEL_CACHE: Dict[Tuple[str, str], Tuple[cv2.dnn_Net, List[str]]] = {}
+_CLASS_NAME_CACHE: Dict[str, List[str]] = {}
+
+
+def _resolve_yolo_output_layers(net: cv2.dnn_Net) -> List[str]:
+    layer_names = net.getLayerNames()
+    try:
+        # OpenCV newer versions
+        return [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+    except Exception:
+        # OpenCV older versions
+        return [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+
+
+def _load_class_names(classes_path: str) -> List[str]:
+    cached = _CLASS_NAME_CACHE.get(classes_path)
+    if cached is not None:
+        return cached
+
+    with open(classes_path, "r", encoding="utf-8") as f:
+        classes = [
+            sanitize_class_label(line.strip(), fallback=f"class_{index}")
+            for index, line in enumerate(f.readlines())
+        ]
+    _CLASS_NAME_CACHE[classes_path] = classes
+    return classes
+
+
+def _load_yolo_net(model_path: str, config_path: str) -> Tuple[cv2.dnn_Net, List[str]]:
+    cache_key = (model_path, config_path)
+    cached = _YOLO_MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    net = cv2.dnn.readNetFromDarknet(config_path, model_path)
+    output_layers = _resolve_yolo_output_layers(net)
+    _YOLO_MODEL_CACHE[cache_key] = (net, output_layers)
+    return net, output_layers
 
 # Tool implementations
 def detect_features_tool(
@@ -37,6 +88,7 @@ def detect_features_tool(
     """
     try:
         image_path = str(safe_path(image_path))
+
         # Read image from path
         img = cv2.imread(image_path)
         if img is None:
@@ -365,12 +417,7 @@ def detect_faces_tool(
             
         elif method.lower() == 'dnn':
             # Paths to the model files
-            # Note: You would need to download these files for actual use
-            _env_models_dir = os.environ.get("OPENCV_DNN_MODELS_DIR")
-            _default_models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
-            model_dir = _env_models_dir if _env_models_dir else _default_models_dir
-            if not os.path.exists(model_dir):
-                os.makedirs(model_dir, exist_ok=True)
+            model_dir = str(get_models_dir())
                 
             prototxt_path = os.path.join(model_dir, "deploy.prototxt")
             model_path = os.path.join(model_dir, "res10_300x300_ssd_iter_140000.caffemodel")
@@ -504,9 +551,46 @@ def detect_objects_tool(
     
     REGRAS DE ARQUIVO:
     - 'image_path': Caminho da imagem. Imagem será criada com as caixas (bounding boxes).
+
+    LIMITES E SEGURANÇA:
+    - `confidence_threshold` e `nms_threshold` devem estar em [0.0, 1.0].
+    - `width` e `height` respeitam `MERLIN_CV_MAX_IMAGE_DIMENSION`.
+    - `model_path`, `config_path` e `classes_path` ficam restritos a `OPENCV_DNN_MODELS_DIR`.
+    - Labels de classe são sanitizados para reduzir risco de prompt injection ao encadear resultados.
+
+    RETORNO RELEVANTE PARA AGENTE:
+    - `objects`: lista estruturada para raciocínio sem parsing de texto.
+    - `model_info.input_size`: facilita ajuste de performance/qualidade em chamadas futuras.
+    - `output_path`: imagem anotada pronta para próxima etapa.
     """
     try:
         image_path = str(safe_path(image_path))
+        confidence_threshold = validate_float_param(
+            "confidence_threshold",
+            confidence_threshold,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        nms_threshold = validate_float_param(
+            "nms_threshold",
+            nms_threshold,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        width = validate_int_param(
+            "width",
+            width,
+            minimum=32,
+            maximum=get_max_image_dimension(),
+        )
+        height = validate_int_param(
+            "height",
+            height,
+            minimum=32,
+            maximum=get_max_image_dimension(),
+        )
+        thickness = validate_int_param("thickness", thickness, minimum=1, maximum=20)
+
         # Read image from path
         img = cv2.imread(image_path)
         if img is None:
@@ -518,25 +602,10 @@ def detect_objects_tool(
         # Get image dimensions
         (orig_h, orig_w) = img.shape[:2]
         
-        # Resolve o diretório de modelos de forma absolutamente robusta.
-        # Prioridade:
-        # 1. Variável de ambiente OPENCV_DNN_MODELS_DIR (configurada no config_ex.json)
-        # 2. Fallback absoluto: diretório `models/` dentro do próprio pacote do servidor
-        _env_models_dir = os.environ.get("OPENCV_DNN_MODELS_DIR")
-        _default_models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
-        model_dir = _env_models_dir if _env_models_dir else _default_models_dir
-        if not os.path.exists(model_dir):
-            os.makedirs(model_dir, exist_ok=True)
-        
-        # Use default YOLO model if paths not provided
-        if model_path is None:
-            model_path = os.path.join(model_dir, "yolov3.weights")
-        
-        if config_path is None:
-            config_path = os.path.join(model_dir, "yolov3.cfg")
-            
-        if classes_path is None:
-            classes_path = os.path.join(model_dir, "coco.names")
+        model_dir = str(get_models_dir())
+        model_path = resolve_model_asset_path(model_path, "yolov3.weights")
+        config_path = resolve_model_asset_path(config_path, "yolov3.cfg")
+        classes_path = resolve_model_asset_path(classes_path, "coco.names")
         
         # Check if model files exist
         model_files_exist = os.path.exists(model_path) and os.path.exists(config_path)
@@ -565,8 +634,7 @@ def detect_objects_tool(
         
         # Load class names
         try:
-            with open(classes_path, 'r') as f:
-                classes = [line.strip() for line in f.readlines()]
+            classes = _load_class_names(classes_path)
         except Exception as e:
             logger.error(f"Error loading class names: {str(e)}")
             # Provide a small subset of COCO classes as fallback
@@ -574,7 +642,7 @@ def detect_objects_tool(
         
         # Try to load the model
         try:
-            net = cv2.dnn.readNetFromDarknet(config_path, model_path)
+            net, output_layers = _load_yolo_net(model_path, config_path)
         except Exception as e:
             logger.error(f"Error loading DNN model: {str(e)}")
             return {
@@ -584,17 +652,6 @@ def detect_objects_tool(
                     "config_path": config_path
                 }
             }
-        
-        # Get output layer names
-        layer_names = net.getLayerNames()
-        
-        # OpenCV 4.5.4+ has a different indexing system
-        try:
-            # For newer OpenCV versions
-            output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
-        except:
-            # For older OpenCV versions
-            output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
         
         # Create a blob from the image
         blob = cv2.dnn.blobFromImage(img, 1/255.0, (width, height), swapRB=True, crop=False)

@@ -5,8 +5,11 @@ import logging
 import datetime
 import subprocess
 import platform
+import re
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
+
+from .security import record_security_event
 
 logger = logging.getLogger("opencv-mcp-server.utils")
 
@@ -21,6 +24,260 @@ SHARED_WORKSPACE = Path(WORKSPACE_ENV).resolve()
 SHARED_WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 logger.info(f"🧙‍♂️ Merlin CV rodando. Workspace seguro travado em: {SHARED_WORKSPACE}")
+
+AUTO_OPEN_ENV = "MERLIN_CV_AUTO_OPEN"
+CAMERA_PREVIEW_ENV = "MERLIN_CV_CAMERA_PREVIEW"
+CAMERA_ENABLE_ENV = "MERLIN_CV_ENABLE_CAMERA"
+MAX_IMAGE_DIMENSION_ENV = "MERLIN_CV_MAX_IMAGE_DIMENSION"
+MAX_VIDEO_FRAMES_ENV = "MERLIN_CV_MAX_VIDEO_FRAMES"
+MAX_CAMERA_DURATION_ENV = "MERLIN_CV_MAX_CAMERA_DURATION_SECONDS"
+MAX_VIDEO_FPS_ENV = "MERLIN_CV_MAX_VIDEO_FPS"
+DEFAULT_MODELS_DIR = (Path(__file__).resolve().parent.parent / "models").resolve()
+DEFAULT_MAX_IMAGE_DIMENSION = 4096
+DEFAULT_MAX_VIDEO_FRAMES = 1200
+DEFAULT_MAX_CAMERA_DURATION_SECONDS = 60
+DEFAULT_MAX_VIDEO_FPS = 60.0
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except (TypeError, ValueError):
+        record_security_event(
+            "invalid_env_int",
+            name=name,
+            value=raw,
+            default=default,
+        )
+        logger.warning("Invalid integer for %s=%r. Using default=%s", name, raw, default)
+        return default
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw.strip())
+    except (TypeError, ValueError):
+        record_security_event(
+            "invalid_env_float",
+            name=name,
+            value=raw,
+            default=default,
+        )
+        logger.warning("Invalid float for %s=%r. Using default=%s", name, raw, default)
+        return default
+    return max(minimum, value)
+
+
+def should_auto_open_outputs() -> bool:
+    """
+    Whether image/video outputs should be opened with system viewers automatically.
+    Disabled by default for headless and agent-driven environments.
+    """
+    return _env_flag(AUTO_OPEN_ENV, default=False)
+
+
+def should_show_camera_preview() -> bool:
+    """
+    Whether camera-based tools may display OpenCV GUI preview windows.
+    Disabled by default for headless and agent-driven environments.
+    """
+    return _env_flag(CAMERA_PREVIEW_ENV, default=False)
+
+
+def should_enable_camera_access() -> bool:
+    """
+    Whether camera capture tools are enabled.
+    Disabled by default so hardware access requires explicit opt-in.
+    """
+    return _env_flag(CAMERA_ENABLE_ENV, default=False)
+
+
+def get_max_image_dimension() -> int:
+    return _env_int(MAX_IMAGE_DIMENSION_ENV, DEFAULT_MAX_IMAGE_DIMENSION, minimum=64)
+
+
+def get_max_video_frames() -> int:
+    return _env_int(MAX_VIDEO_FRAMES_ENV, DEFAULT_MAX_VIDEO_FRAMES, minimum=1)
+
+
+def get_max_camera_duration_seconds() -> int:
+    return _env_int(
+        MAX_CAMERA_DURATION_ENV,
+        DEFAULT_MAX_CAMERA_DURATION_SECONDS,
+        minimum=1,
+    )
+
+
+def get_max_video_fps() -> float:
+    return _env_float(MAX_VIDEO_FPS_ENV, DEFAULT_MAX_VIDEO_FPS, minimum=1.0)
+
+
+def get_models_dir() -> Path:
+    """
+    Resolve the directory containing DNN model assets.
+    Priority:
+    1) OPENCV_DNN_MODELS_DIR env var
+    2) repository-local default models directory
+    """
+    configured = os.getenv("OPENCV_DNN_MODELS_DIR", "").strip()
+    if configured:
+        model_dir = Path(configured).expanduser()
+        if not model_dir.is_absolute():
+            model_dir = (SHARED_WORKSPACE / model_dir).resolve()
+    else:
+        model_dir = DEFAULT_MODELS_DIR
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    return model_dir
+
+
+def resolve_model_asset_path(requested_path: Optional[str], default_filename: str) -> str:
+    """
+    Resolve model-related paths and enforce they remain inside OPENCV_DNN_MODELS_DIR.
+    Relative paths are resolved against the models directory.
+    """
+    model_dir = get_models_dir().resolve()
+    raw_path = (requested_path or "").strip()
+
+    if not raw_path:
+        target_path = (model_dir / default_filename).resolve()
+    else:
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_absolute():
+            target_path = candidate.resolve()
+        else:
+            target_path = (model_dir / candidate).resolve()
+
+    if not target_path.is_relative_to(model_dir):
+        record_security_event(
+            "model_asset_path_blocked",
+            requested=requested_path,
+            resolved=str(target_path),
+            model_dir=str(model_dir),
+        )
+        msg = (
+            "Model path must stay inside OPENCV_DNN_MODELS_DIR "
+            f"({model_dir}). Received: {target_path}"
+        )
+        logger.warning(msg)
+        raise PermissionError(msg)
+
+    return str(target_path)
+
+
+_CLASS_LABEL_SAFE_RE = re.compile(r"[^A-Za-z0-9 _./:+()-]+")
+_MAX_CLASS_LABEL_LEN = 64
+
+
+def sanitize_class_label(raw_label: str, fallback: str = "unknown") -> str:
+    """
+    Sanitize model class labels before exposing them in tool output/prompts.
+    """
+    original = "" if raw_label is None else str(raw_label)
+    text = original
+    text = text.replace("\x00", " ").replace("\r", " ").replace("\n", " ").strip()
+    text = _CLASS_LABEL_SAFE_RE.sub(" ", text)
+    text = " ".join(text.split())
+
+    if len(text) > _MAX_CLASS_LABEL_LEN:
+        text = text[:_MAX_CLASS_LABEL_LEN].rstrip()
+
+    sanitized = text or fallback
+    if sanitized != original.strip():
+        record_security_event("class_label_sanitized")
+    return sanitized
+
+
+def validate_int_param(
+    name: str,
+    value: Any,
+    *,
+    minimum: int,
+    maximum: Optional[int] = None,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        record_security_event(
+            "invalid_parameter_int",
+            name=name,
+            value=value,
+            reason="not_integer",
+        )
+        raise ValueError(f"Parameter '{name}' must be an integer.")
+
+    if parsed < minimum:
+        record_security_event(
+            "invalid_parameter_int",
+            name=name,
+            value=parsed,
+            minimum=minimum,
+            reason="below_minimum",
+        )
+        raise ValueError(f"Parameter '{name}' must be >= {minimum}.")
+    if maximum is not None and parsed > maximum:
+        record_security_event(
+            "invalid_parameter_int",
+            name=name,
+            value=parsed,
+            maximum=maximum,
+            reason="above_maximum",
+        )
+        raise ValueError(f"Parameter '{name}' must be <= {maximum}.")
+    return parsed
+
+
+def validate_float_param(
+    name: str,
+    value: Any,
+    *,
+    minimum: float,
+    maximum: Optional[float] = None,
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        record_security_event(
+            "invalid_parameter_float",
+            name=name,
+            value=value,
+            reason="not_number",
+        )
+        raise ValueError(f"Parameter '{name}' must be a number.")
+
+    if parsed < minimum:
+        record_security_event(
+            "invalid_parameter_float",
+            name=name,
+            value=parsed,
+            minimum=minimum,
+            reason="below_minimum",
+        )
+        raise ValueError(f"Parameter '{name}' must be >= {minimum}.")
+    if maximum is not None and parsed > maximum:
+        record_security_event(
+            "invalid_parameter_float",
+            name=name,
+            value=parsed,
+            maximum=maximum,
+            reason="above_maximum",
+        )
+        raise ValueError(f"Parameter '{name}' must be <= {maximum}.")
+    return parsed
 
 def safe_path(requested_path: str) -> Path:
     """
@@ -39,11 +296,21 @@ def safe_path(requested_path: str) -> Path:
     try:
         target_path = target_path.resolve()
     except Exception as e:
+        record_security_event(
+            "workspace_path_invalid",
+            requested=requested_path,
+        )
         raise ValueError(f"Caminho inválido ou inacessível: {requested_path}")
 
     # 4. A TRAVA DE SEGURANÇA (Obrigatório Python >= 3.9)
     # Verifica matematicamente se o caminho resolvido é filho do workspace
     if not target_path.is_relative_to(SHARED_WORKSPACE):
+        record_security_event(
+            "workspace_path_blocked",
+            requested=requested_path,
+            resolved=str(target_path),
+            workspace=str(SHARED_WORKSPACE),
+        )
         msg = f"Acesso negado: Tentativa de violação de limite de diretório ({target_path})"
         logger.warning(msg)
         raise PermissionError(msg)
@@ -94,6 +361,11 @@ def open_image_with_system_viewer(image_path: str) -> None:
     Args:
         image_path: Path to the image file
     """
+    if not should_auto_open_outputs():
+        return
+
+    image_path = str(safe_path(image_path))
+
     # Platform-specific image opening commands
     system = platform.system()
     
@@ -117,6 +389,11 @@ def open_video_with_system_viewer(video_path: str) -> None:
     Args:
         video_path: Path to the video file
     """
+    if not should_auto_open_outputs():
+        return
+
+    video_path = str(safe_path(video_path))
+
     # Platform-specific video opening commands
     system = platform.system()
     
@@ -193,12 +470,12 @@ def save_and_display(img: np.ndarray, original_path: str, operation: str) -> str
         # Get directory of original image
         directory = os.path.dirname(original_path) or '.'
     
-    new_path = os.path.join(directory, new_filename)
+    new_path = str(safe_path(os.path.join(directory, new_filename)))
     
     # Save image
     cv2.imwrite(new_path, img)
     
-    # Display image using system's default image viewer
+    # Display image only when explicitly enabled.
     open_image_with_system_viewer(new_path)
     
     return new_path
