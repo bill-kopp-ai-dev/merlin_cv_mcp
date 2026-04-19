@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
-Merlin CV MCP Server entrypoint.
-
-Standardized runtime with FastMCP supporting:
-- stdio (default)
-- sse
-- streamable-http
+Merlin CV MCP Server - Standardized entrypoint.
 """
 
 from __future__ import annotations
@@ -18,22 +13,23 @@ import os
 import sys
 from ipaddress import ip_address
 
-from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 import uvicorn
 
+# Import shared MCP instance
+from .mcp_instance import mcp
+# Import modules to trigger tool registration via decorators
+from . import computer_vision, image_basics, image_processing, security, video_processing, profile_tool
+
+from .utils.config import DEFAULT_HOST, DEFAULT_PORT
 from .security import record_security_event
 
 logger = logging.getLogger("merlin-cv-mcp")
 
-SERVER_NAME = "merlin-cv-mcp"
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8080
 DEFAULT_AUTH_TOKEN_ENV_VAR = "MCP_MERLIN_AUTH_TOKEN"
-
 
 def _configure_logging() -> None:
     logging.basicConfig(
@@ -41,7 +37,6 @@ def _configure_logging() -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[logging.StreamHandler(sys.stderr)],
     )
-
 
 def _is_loopback_host(host: str) -> bool:
     normalized = (host or "").strip().lower()
@@ -52,16 +47,13 @@ def _is_loopback_host(host: str) -> bool:
     except ValueError:
         return False
 
-
 def _extract_bearer_token(auth_header: str | None) -> str | None:
     if not auth_header:
         return None
     parts = auth_header.split(" ", 1)
     if len(parts) != 2 or parts[0].lower() != "bearer":
         return None
-    token = parts[1].strip()
-    return token or None
-
+    return parts[1].strip() or None
 
 class _AuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: Starlette, token: str):
@@ -84,55 +76,17 @@ class _AuthMiddleware(BaseHTTPMiddleware):
         )
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
-
-def register_tools(mcp_server: FastMCP) -> None:
-    """Register all tool modules in the server."""
-    from . import computer_vision
-    from . import image_basics
-    from . import image_processing
-    from . import security
-    from . import video_processing
-
-    logger.info("Registering Merlin CV tools")
-    security.register_tools(mcp_server)
-    image_basics.register_tools(mcp_server)
-    image_processing.register_tools(mcp_server)
-    computer_vision.register_tools(mcp_server)
-    video_processing.register_tools(mcp_server)
-    logger.info("All tools registered successfully")
-
-
-def create_server(host: str, port: int) -> FastMCP:
-    server = FastMCP(
-        SERVER_NAME,
-        host=host,
-        port=port,
-        sse_path="/sse",
-        message_path="/messages/",
-        streamable_http_path="/mcp",
-        stateless_http=False,
-    )
-    register_tools(server)
-    return server
-
-
-def _create_http_app(
-    mcp_server: FastMCP,
-    *,
-    mode: str,
-    auth_token: str | None,
-) -> Starlette:
+def _create_http_app(mode: str, auth_token: str | None) -> Starlette:
     if mode == "sse":
-        app = mcp_server.sse_app()
+        app = mcp.sse_app()
     elif mode == "streamable-http":
-        app = mcp_server.streamable_http_app()
+        app = mcp.streamable_http_app()
     else:
         raise ValueError(f"Unsupported HTTP mode: {mode}")
 
     if auth_token:
         app.add_middleware(_AuthMiddleware, token=auth_token)
     return app
-
 
 async def run_server(
     *,
@@ -143,9 +97,8 @@ async def run_server(
     auth_token: str | None,
 ) -> None:
     if mode == "stdio":
-        mcp_server = create_server(host=DEFAULT_HOST, port=DEFAULT_PORT)
         logger.info("Starting Merlin CV MCP in stdio mode")
-        await mcp_server.run_stdio_async()
+        await mcp.run_stdio_async()
         return
 
     if mode not in {"sse", "streamable-http"}:
@@ -153,71 +106,27 @@ async def run_server(
 
     loopback_host = _is_loopback_host(host)
     if not loopback_host and not allow_remote_http:
-        record_security_event(
-            "remote_bind_blocked",
-            host=host,
-            mode=mode,
-            reason="missing_allow_remote_http",
-        )
-        raise ValueError(
-            "Refusing to bind HTTP transport to a non-loopback host without --allow-remote-http."
-        )
+        record_security_event("remote_bind_blocked", host=host, reason="missing_allow_remote_http")
+        raise ValueError("Refusing to bind HTTP transport to a non-loopback host without --allow-remote-http.")
 
     if not loopback_host and not auth_token:
-        record_security_event(
-            "remote_bind_blocked",
-            host=host,
-            mode=mode,
-            reason="missing_auth_token",
-        )
-        raise ValueError(
-            "Remote HTTP binding requires an auth token. "
-            f"Set {DEFAULT_AUTH_TOKEN_ENV_VAR} or pass --auth-token-env."
-        )
+        record_security_event("remote_bind_blocked", host=host, reason="missing_auth_token")
+        raise ValueError("Remote HTTP binding requires an auth token.")
 
-    mcp_server = create_server(host=host, port=port)
-    http_app = _create_http_app(mcp_server, mode=mode, auth_token=auth_token)
+    http_app = _create_http_app(mode=mode, auth_token=auth_token)
     config = uvicorn.Config(http_app, host=host, port=port, log_level="info")
     uvicorn_server = uvicorn.Server(config)
 
     logger.info("Starting Merlin CV MCP in %s mode on %s:%s", mode, host, port)
     await uvicorn_server.serve()
 
-
 async def async_main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Merlin CV MCP Server - supports stdio, sse, and streamable-http modes"
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["stdio", "sse", "streamable-http"],
-        default="stdio",
-        help="Server mode: stdio (default), sse, or streamable-http",
-    )
-    parser.add_argument(
-        "--host",
-        default=DEFAULT_HOST,
-        help=f"Host to bind in HTTP modes (default: {DEFAULT_HOST})",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help=f"Port for HTTP modes (default: {DEFAULT_PORT} or PORT env var)",
-    )
-    parser.add_argument(
-        "--allow-remote-http",
-        action="store_true",
-        help="Allow binding HTTP transports to non-loopback hosts.",
-    )
-    parser.add_argument(
-        "--auth-token-env",
-        default=DEFAULT_AUTH_TOKEN_ENV_VAR,
-        help=(
-            "Environment variable name storing HTTP auth token "
-            f"(default: {DEFAULT_AUTH_TOKEN_ENV_VAR})."
-        ),
-    )
+    parser = argparse.ArgumentParser(description="Merlin CV MCP Server")
+    parser.add_argument("--mode", choices=["stdio", "sse", "streamable-http"], default="stdio")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--allow-remote-http", action="store_true")
+    parser.add_argument("--auth-token-env", default=DEFAULT_AUTH_TOKEN_ENV_VAR)
     args = parser.parse_args()
 
     port = args.port if args.port is not None else int(os.environ.get("PORT", DEFAULT_PORT))
@@ -231,11 +140,9 @@ async def async_main() -> None:
         auth_token=auth_token,
     )
 
-
 def main() -> None:
     _configure_logging()
     asyncio.run(async_main())
-
 
 if __name__ == "__main__":
     main()
